@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+  <title>WhatsApp Web Multi</title>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="https://unpkg.com/sakura.css/css/sakura.css" type="text/css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/1.7.3/socket.io.js"></script>
+  </head>
+  <script type="module">
+    import { html, render, useState, useEffect, useRef } from 'https://unpkg.com/htm/preact/standalone.module.js'
+
+    const socket = io();
+    
+    const App = () => {
+      const [isLoading, setLoading] = useState(true);
+      const [listChats, setListChats] = useState([]);
+      const [isConnected, setConnected] = useState(false); 
+      const [selectedChat, setSelectedChat] = useState(null);
+      const [newMsg, setNewMsg] = useState(null);
+      const [strClient, setStrClient] = useState('');
+      const [strQR, setStrQR] = useState('');
+      const [contacts, setContacts] = useState([]);
+
+      function fetchChats() {
+        fetch(`/info`)
+          .then(res => res.json())
+          .then(data => {
+            if (data.phone != null) {
+              setConnected(true);
+              fetch(`/chats`)
+                .then(res => res.json())
+                .then(data => { 
+                  setListChats(data || []);
+                  setLoading(false);
+                  document.title += ' - ' + (data.filter(c => c.unreadCount > 0).length);
+                });
+              fetchContacts();
+            }
+            else
+              setLoading(false);
+        });
+      }
+      
+      function fetchMsgs(c) {
+        setLoading(true);
+        fetch(`/chat/` + c.id.user)
+          .then(res => res.json())
+          .then(data => {
+            c.msgs = data;
+            c.lastMsg = data.slice(-1)[0];
+            setLoading(false);
+            c.msgs.forEach(m => {
+              var fC = contacts.find(ct => ct.id._serialized == m.author);
+              m.authorName = (fC ? (fC.name ? fC.name : (fC.pushname ? fC.pushname : m.author)) : m.author); 
+            });
+          });
+      }
+      
+      function fetchContacts() {
+        fetch(`/contacts`)
+          .then(res => res.json())
+          .then(data => setContacts(data || []));
+      }
+      
+      const selectChat = (c) => {
+        setSelectedChat(c);
+        fetchMsgs(c);
+      }
+      
+      useEffect(() => {
+        socket.on('connect', () => {
+          console.log('io connected');
+          fetchChats();
+        });
+        
+        socket.on('message', (data) => {
+          setNewMsg(data);
+        });
+        
+        socket.on('message_read', (data) => {
+          setNewMsg(data);
+        });
+        
+        socket.on('client', (data) => {
+          setStrClient(data);
+          if(data.endsWith('ready!')) {
+            setConnected(true);
+            fetchChats();
+          }
+        });
+        
+        socket.on('qr', (data) => {
+          setStrQR(data);
+        })
+      }, []);
+      
+      if (isLoading)
+        return html`<${Loading} />`;
+      
+      if (isConnected)
+      {
+        if (newMsg) {
+          var find = listChats.find(c => c.id._serialized == (newMsg.fromMe ? newMsg.to : newMsg.from));
+          if(find) {
+            if (newMsg.ack == 3) {
+              find.unreadCount = 0;
+            }
+            else
+            {
+              if (newMsg.fromMe)
+                find.unreadCount = 0;
+              else
+                find.unreadCount++;
+              find.lastMsg = newMsg;
+              find.timestamp = newMsg.timestamp;
+              listChats.splice(listChats.indexOf(find), 1);
+              listChats.unshift(find);
+              if (selectedChat && selectedChat.id._serialized == find.id._serialized)
+                selectedChat.msgs.push(newMsg);
+            }
+          }
+          else {
+            var newChat = {
+              id: {
+                user: (newMsg.fromMe ? newMsg.to : newMsg.from).replace('@g.us','').replace('@c.us',''),
+                _serialized: newMsg.fromMe ? newMsg.to : newMsg.from
+              },
+              name: (newMsg.fromMe ? newMsg.to : newMsg.from).replace('@g.us','').replace('@c.us',''),
+              lastMsg: newMsg,
+              timestamp: newMsg.timestamp,
+              unreadCount: newMsg.fromMe ? 0 : 1
+            };
+            listChats.unshift(newChat);
+          }
+          setNewMsg(null);
+          document.title = document.title.substring(0, document.title.indexOf('-')) + ' - ' + (listChats.filter(c => c.unreadCount > 0).length);
+        } 
+        
+        if (selectedChat == null) {
+          return html`
+            <table>
+              <caption>${strClient}</caption>
+              ${listChats.map(c => html`
+                <${Chat} chat=${c} select="${selectChat}"/>
+                  `)}
+            </table>`;
+        }
+        
+        return html`
+          <button onClick="${() => setSelectedChat(null)}" style='position:fixed; top:10px; left:0'>Back</button>
+          <${Message} selectedChat="${selectedChat}"/>`;
+      }
+      return html`<${Disconnect} qr=${strQR}/>`;
+    }
+
+    const Chat = ({chat,select}) =>
+        html`
+        <tr onclick='${() => select(chat)}'>
+          <td>
+            
+          </td>
+          <td valign='top'>
+            <strong>${chat.name}</strong>
+            <div>${chat.lastMsg && (chat.lastMsg.type == 'chat' ? chat.lastMsg.body.substring(0,40) : '(' + chat.lastMsg.type + ')')}</div>
+          </td>
+          <td align='right'>
+            ${new Date(chat.timestamp * 1000) > new Date(new Date().setDate(new Date().getDate()-1)) ? new Date(chat.timestamp * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', hour12: false}) : new Date(chat.timestamp * 1000).toLocaleDateString() }
+            <div>${chat.unreadCount > 0 ? chat.unreadCount : ' '}</div>
+          </td>  
+        </tr>
+        `;
+    
+    const Message = ({selectedChat}) => {
+      const[txt,setTxt] = useState('');
+      
+      const messagesEndRef = useRef(null);
+      const scrollToBottom = () => {
+        messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
+      };
+      
+      useEffect(scrollToBottom);
+      
+      const onInputTxt = function(e) {
+        setTxt(e.target.value);
+      }
+      
+      const sendMessage = function() {
+        var body = {
+          number: selectedChat.id.user,
+          message: txt
+        };
+        fetch(`/send`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(body)
+        })
+          .then(() => {
+            var newMsg = 
+              {
+                body: txt,
+                timestamp: parseInt((new Date().getTime() / 1000).toFixed(0)),
+                fromMe: true,
+                type: 'chat'
+              };
+            setTxt('');
+          });
+      };
+      
+      const fetchImage = function(m) {
+        if (m.type != 'image')
+          return '';
+        
+        const [url,setUrl] = useState('');
+          
+        useEffect(() => {
+          fetch('/getimage/' + selectedChat.id.user + '/' + m.id.id)
+            .then(res => res.json())
+            .then(data => setUrl(data.data));
+        }, []);
+        
+        return html`<img src='data:image/jpg;base64,${url}' alt='${m.id.id}'/>`;
+      };
+      
+      return html`
+          <div style='height:81vh;overflow:auto'>
+            <table>
+              <caption>${selectedChat.name}</caption>
+              ${selectedChat.msgs.map(m => html`
+                <tr>
+                  <td align='${m.fromMe ? 'right' : 'left'}' style='background-color: ${m.fromMe ? 'white' : 'lightgrey'}'>
+                    <small>${(m.fromMe ? 'me' : m.author ? m.authorName : selectedChat.name) + ' - ' + (new Date(m.timestamp * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', hour12: false}))}
+                    </small><br/>
+                    <span style='white-space: pre-line;'>${m.body}</span>
+                    ${fetchImage(m)}
+                  </td>
+                </tr>
+                `)}
+            </table>
+            <div ref=${messagesEndRef} />
+          </div>
+          <div style='overflow: hidden; position: fixed; bottom: 0; left:0; width: 100%; max-width:600px; height:10vh; background-color: darkseagreen'>
+            <textarea style="width:80%" placeholder="Enter your message here" rows="2" value=${txt} onInput='${onInputTxt}'></textarea>
+            <button style='float:right' onClick='${sendMessage}'>Send</button>
+          </div>
+        `;
+    }
+    
+    const Disconnect = ({qr}) =>
+      html`
+        <h4>Scan QR using Whatsapp on your Phone</h4>
+        <img src='https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${qr}'/>
+        <img src='/qr'/>
+      `;
+
+    const Loading = () =>
+      html`<div style='position: absolute; top: 50%; width:100%; margin: 0'><center><h1>Loading...</h1></center></div>`;
+    
+    const Header = () =>
+      html`
+      <div style='overflow: hidden; position: fixed; top: 0; left:0; width: 100%; height:9vh; background-color: darkseagreen'>
+        <center><h2 style='margin-top:1rem'>WhatsApp Web Multi</h2></center>
+      </div>`;
+
+    render(html`
+      <${Header}/>
+      <div style='position:absolute;top:9vh;bottom:0px;width:100%;height:91vh;overflow:auto'>
+        <${App}/>
+      </div>`
+      , document.body);
+  </script>
+  <body style="height:100vh;padding:0;margin:0">
+  </body>
+</html>
